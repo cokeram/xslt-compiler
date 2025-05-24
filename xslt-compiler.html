@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>XSLT Compiler</title>
+    <style>
+        body {
+            margin: 0;
+            height: 100vh;
+            display: flex;
+            font-family: Arial, sans-serif;
+        }
+        .container {
+            display: flex;
+            width: 100vw;
+            height: 100vh;
+        }
+        .left {
+            width: 50vw;
+            display: flex;
+            flex-direction: column;
+        }
+        .pane {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            border-right: 1px solid #ccc;
+            border-bottom: 1px solid #ccc;
+            overflow: hidden;
+        }
+        .pane:last-child {
+            border-bottom: none;
+        }
+        .pane label {
+            background: #f0f0f0;
+            padding: 4px 8px;
+            font-weight: bold;
+        }
+        .numbered {
+            display: flex;
+            height: 100%;
+            position: relative;
+            overflow: hidden;
+            flex-direction: row;
+        }
+        .numbers {
+            background: #eee;
+            color: #888;
+            text-align: right;
+            user-select: none;
+            font-size: 14px;
+            font-family: 'Fira Mono', 'Consolas', monospace;
+            width: 38px;
+            min-width: 38px;
+            max-width: 38px;
+            line-height: 1.5;
+            height: 100%;
+            box-sizing: border-box;
+            overflow-y: auto;
+            overflow-x: hidden;
+            margin: 0;
+            padding: 0 4px 0 0;
+            z-index: 2;
+            position: relative;
+            left: 0;
+        }
+        .code-area {
+            flex: 1;
+            width: 100%;
+            resize: none;
+            border: none;
+            padding: 0 0 0 6px;
+            font-family: 'Fira Mono', 'Consolas', monospace;
+            font-size: 14px;
+            background: #fafafa;
+            outline: none;
+            overflow: auto;
+            line-height: 1.5;
+            box-sizing: border-box;
+            white-space: pre;
+        }
+        .right {
+            width: 50vw;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        .header {
+            width: 100vw;
+            background: #2d3e50;
+            color: #fff;
+            font-size: 1.5rem;
+            font-weight: bold;
+            padding: 12px 0 12px 32px;
+            letter-spacing: 1px;
+            display: flex;
+            align-items: center;
+            justify-content: flex-start;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.07);
+        }
+        .footer {
+            width: 100vw;
+            text-align: center;
+            padding: 8px 0;
+            background: #f0f0f0;
+            font-size: 1.1rem;
+            font-weight: bold;
+            letter-spacing: 1px;
+            position: absolute;
+            bottom: 0;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="left">
+        <div class="pane" style="height: 50%;">
+            <label>XML Input</label>
+            <div class="numbered">
+                <pre class="numbers" id="xml-lines"></pre>
+                <textarea id="xml-input" class="code-area" spellcheck="false"></textarea>
+            </div>
+        </div>
+        <div class="pane" style="height: 50%; border-bottom: none;">
+            <label>Result</label>
+            <div class="numbered">
+                <pre class="numbers" id="result-lines"></pre>
+                <textarea id="result" class="code-area" readonly></textarea>
+            </div>
+        </div>
+    </div>
+    <div class="right">
+        <div class="pane" style="height: 100%; border-bottom: none;">
+            <label>XSLT Code</label>
+            <div class="numbered">
+                <pre class="numbers" id="xslt-lines"></pre>
+                <textarea id="xslt-input" class="code-area" spellcheck="false"></textarea>
+            </div>
+        </div>
+    </div>
+</div>
+<!-- Add Saxon-JS for XSLT 3.0 support -->
+<script src="https://cdn.jsdelivr.net/npm/saxon-js@2.6.0/SaxonJS2.js"></script>
+<script>
+if (!window.SaxonJS) {
+    document.addEventListener('DOMContentLoaded', function() {
+        const resultArea = document.getElementById('result');
+        if (resultArea) {
+            resultArea.value = '\n[Saxon-JS library failed to load. Please check your internet connection or try running this file via a local web server (not file:// protocol).]';
+        }
+    });
+}
+
+function updateLineNumbers(textarea, linesElem) {
+    // Only add a new row number for each real line in the textarea
+    const lines = textarea.value.split(/\r?\n/);
+    let numbers = '';
+    for (let i = 0; i < lines.length; i++) numbers += (i + 1) + '\n';
+    linesElem.textContent = numbers;
+    linesElem.scrollTop = textarea.scrollTop;
+}
+
+function autoResizeNumbers() {
+    document.querySelectorAll('.numbers').forEach(num => {
+        num.style.height = '100%';
+    });
+}
+
+async function compileXSLT() {
+    const xml = document.getElementById('xml-input').value;
+    const xslt = document.getElementById('xslt-input').value;
+    const resultArea = document.getElementById('result');
+    // Helper to extract error line/column from error message
+    function extractDetailsFromParserErrorText(errorText, type /* "XML" or "XSLT" */) {
+        let line = null, column = null;
+        let coreMessage = errorText.trim(); // Start with the full text, will be refined
+
+        // Try to find line/column info first, then isolate the message
+        // Firefox: "Line Number L, Column C:" (often at the end or mid-string)
+        let ffLineColMatch = errorText.match(/Line Number\s*(\d+)(?:,\s*Column\s*(\d+))?/i);
+        if (ffLineColMatch) {
+            line = parseInt(ffLineColMatch[1], 10);
+            if (ffLineColMatch[2]) column = parseInt(ffLineColMatch[2], 10);
+            
+            let ffMessageMatch = errorText.match(/XML Parsing Error:\s*([\s\S]*?)(?=\s*Location:|\s*Line Number\s*\d+)/i);
+            if (ffMessageMatch && ffMessageMatch[1] && ffMessageMatch[1].trim()) {
+                coreMessage = ffMessageMatch[1].trim();
+            } else { 
+                const afterLineColMatch = errorText.match(/Line Number\s*\d+(?:,\s*Column\s*\d+)?:([\s\S]*)/i);
+                if(afterLineColMatch && afterLineColMatch[1] && afterLineColMatch[1].trim()){
+                    coreMessage = afterLineColMatch[1].trim(); // Allow multi-line
+                } else {
+                     coreMessage = "Could not isolate error message from parser output.";
+                }
+            }
+        } else {
+            // Chrome: "error on line L at column C: message"
+            let chromeMatch = errorText.match(/error on line (\d+) at column (\d+):\s*([\s\S]*)/i); // Allow message to be empty or multi-line
+            if (chromeMatch) {
+                line = parseInt(chromeMatch[1], 10);
+                column = parseInt(chromeMatch[2], 10);
+                coreMessage = chromeMatch[3].trim();
+            } // If no specific format found, coreMessage remains the original errorText (trimmed after initial cleaning)
+        }
+        coreMessage = coreMessage.replace(/^(XML Parsing Error|Error):\s*/i, '').trim();
+        // If coreMessage became empty after stripping prefixes, fall back to a generic message or original errorText
+        if (!coreMessage && errorText) {
+            coreMessage = errorText.replace(/^(XML Parsing Error|Error):\s*/i, '').trim();
+        }
+        let formattedMessage = "";
+        if (line !== null) {
+            formattedMessage += `Error on line ${line}`;
+            if (column !== null) {
+                formattedMessage += ` column ${column}`;
+            }
+            formattedMessage += `\n  ${type} Parse Error: ${coreMessage}`;
+        } else {
+            formattedMessage = `${type} Parse Error:\n  ${coreMessage}`;
+        }
+        return { formattedMessage };
+    }
+
+    // If all panes are empty, clear result
+    if (!xml.trim() && !xslt.trim()) {
+        resultArea.value = '\n';
+        updateLineNumbers(resultArea, document.getElementById('result-lines'));
+        return;
+    }
+    // Always use Saxon-JS (XSLT 3.0)
+    if (window.SaxonJS) {
+        try {
+            const output = await SaxonJS.transform({
+                stylesheetText: xslt,
+                sourceText: xml,
+                destination: 'serialized'
+            });
+            const resultText = output.principalResult;
+            if (resultText === null || resultText === undefined || String(resultText).trim() === "") {
+                resultArea.value = '\n' + "[Transformation successful, no output produced]";
+            } else {
+                resultArea.value = '\n' + String(resultText);
+            }
+        } catch (e) {
+            let msg = e.message || String(e);
+            let finalMsg = "";
+            if (typeof e.line === 'number') {
+                finalMsg += `Error on line ${e.line}`;
+                if (typeof e.column === 'number') {
+                    finalMsg += ` column ${e.column}`;
+                }
+                finalMsg += "\n  ";
+            }
+            if (e.code) {
+                finalMsg += `${e.code}: `;
+            }
+            finalMsg += msg.trim();
+            resultArea.value = `\n${finalMsg}`;
+        }
+    } else {
+        resultArea.value = '\nSaxon-JS (XSLT 3.0) is not available in this browser.';
+    }
+    updateLineNumbers(resultArea, document.getElementById('result-lines'));
+}
+
+['xml-input', 'xslt-input', 'result'].forEach(id => {
+    const textarea = document.getElementById(id);
+    const linesElem = document.getElementById(
+        id === 'xml-input' ? 'xml-lines' : id === 'xslt-input' ? 'xslt-lines' : 'result-lines'
+    );
+    textarea.parentElement.style.position = 'relative';
+    linesElem.style.position = 'relative';
+    linesElem.style.left = '0';
+    linesElem.style.top = '0';
+    linesElem.style.width = '38px';
+    linesElem.style.minWidth = '38px';
+    linesElem.style.maxWidth = '38px';
+    linesElem.style.height = '100%';
+    linesElem.style.pointerEvents = 'none';
+    linesElem.style.background = '#eee';
+    linesElem.style.color = '#888';
+    linesElem.style.padding = '0 4px 0 0';
+    linesElem.style.fontSize = '14px';
+    linesElem.style.fontFamily = "'Fira Mono', 'Consolas', monospace";
+    linesElem.style.textAlign = 'right';
+    linesElem.style.lineHeight = '1.5';
+    linesElem.style.overflowY = 'auto';
+    linesElem.style.overflowX = 'hidden';
+    linesElem.style.zIndex = '2';
+    textarea.style.paddingLeft = '6px';
+    textarea.style.fontSize = '14px';
+    textarea.style.lineHeight = '1.5';
+    textarea.style.whiteSpace = 'pre';
+    textarea.style.overflow = 'auto';
+    textarea.style.resize = 'none';
+    textarea.style.boxSizing = 'border-box';
+    textarea.addEventListener('input', () => {
+        updateLineNumbers(textarea, linesElem);
+        if (id !== 'result') compileXSLT();
+    });
+    textarea.addEventListener('scroll', () => {
+        linesElem.scrollTop = textarea.scrollTop;
+    });
+    // Initial sync
+    updateLineNumbers(textarea, linesElem);
+});
+
+// Set default values for XSLT and XML input areas
+// (Do this BEFORE initial compile)
+document.getElementById('xslt-input').value = `<?xml version="1.0" encoding="UTF-8" ?>\n<xsl:transform xmlns:xsl="http://www.w3.org/1999/XSL/Transform" version="2.0">\n    <xsl:output  omit-xml-declaration="yes" encoding="UTF-8" indent="yes" />\n    <xsl:template match="/">      \n        <xsl:apply-templates/>   \n    </xsl:template>\n    <xsl:template match="@*|node()">\n        <xsl:copy>\n            <xsl:apply-templates select="@*|node()"/>\n        </xsl:copy>\n    </xsl:template>\n</xsl:transform>`;
+document.getElementById('xml-input').value = `<Input>\n    <Message>RK VARANGANTI</Message>\n</Input>`;
+// Update line numbers for default values
+updateLineNumbers(document.getElementById('xslt-input'), document.getElementById('xslt-lines'));
+updateLineNumbers(document.getElementById('xml-input'), document.getElementById('xml-lines'));
+
+// Initial compile
+compileXSLT();
+</script>
+</body>
+</html>
